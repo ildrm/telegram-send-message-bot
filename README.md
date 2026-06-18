@@ -2,9 +2,19 @@
 
 A single-file, production-ready **Telegram mass broadcast + user collector bot** written in PHP.
 
-This bot safely collects users from groups and channels where it is an admin and lets one or more owners send **high-volume broadcast campaigns** (text, media, albums, polls, buttons) with flood control, queueing, retries, and basic analytics — all backed by a local SQLite database.
+This bot collects user metadata from groups and channels where it is an admin and lets one or more owners send **opt-in broadcast campaigns** (text, media, polls, buttons) with flood control, queueing, retries, and analytics — all backed by a local SQLite database.
 
 Everything lives in a single file: `telegram-send-message-bot.php`.
+
+> ### ⚠️ Important: who you can actually message
+>
+> The **Telegram Bot API does not allow a bot to start a conversation with a user.** A bot can only send a message to a user who has **already pressed Start / messaged the bot in private** (these are the "starters" / subscribers). Sends to users who were merely *collected* from a group but never started the bot fail with `403: bot can't initiate conversation with a user`.
+>
+> In practice this means: **your real broadcast audience is the "Only Bot Starters" segment.** Collected-from-group data is useful for analytics and source attribution, but those users cannot be DM'd until they subscribe. The bot now auto-blacklists users that return permanent `403` errors so it stops wasting attempts on them.
+>
+> ### ⚠️ Compliance
+>
+> Only broadcast to users who have **opted in** by starting your bot. Mass-DMing scraped/collected users who never opted in violates the [Telegram Terms of Service](https://telegram.org/tos) and anti-spam rules and will get your bot banned. Use `/start` as consent and honour `/stop`.
 
 ---
 
@@ -28,11 +38,11 @@ Everything lives in a single file: `telegram-send-message-bot.php`.
 ### Broadcast engine
 
 - Supports **broadcast campaigns** with:
-  - Text messages.
-  - Media (photos, videos, documents).
-  - Albums.
-  - Polls.
+  - Text messages (with formatting entities).
+  - Media: photos, videos, documents, audio, voice, animations (GIFs) — with captions.
+  - Polls (regular/quiz).
   - Inline buttons (deep links, URLs, callback data).
+  - Save any composed message as a reusable **template**.
 - Uses a **smart queue + retry** system:
   - Each campaign is stored in a `broadcasts` table.
   - Each target user gets a queue item in the `queue` table.
@@ -71,9 +81,12 @@ Owners interact with the bot in **private chat**.
   - `📤 New Broadcast` – create a new broadcast from any message you send.
   - `📊 Statistics` – global stats and per-source breakdown.
   - `📋 Sources` – list groups/channels, active flags, member counts.
-  - `📜 Broadcasts History` – recent broadcasts with sent/failed metrics.
-  - `💾 Export Users` – export collected user data as CSV/JSON.
-  - `⚙️ Settings` – adjust rate limits, safety options, etc.
+  - `📜 Broadcasts History` – recent broadcasts; each has a `📈 Analytics` button (delivery + CTR).
+  - `📁 Templates` – reuse previously saved messages.
+  - `💾 Export Users` – export collected user data as CSV.
+  - `⚙️ Settings` – change the live send rate (msg/min).
+
+During the target step you can also `💾 Save as Template`, and on the confirmation step `🧪 Test Send (to me)` to preview the message to yourself before sending to everyone.
 
 Non-owner users who send `/start` simply see a short info message: they are **recipients**, not controllers.
 
@@ -94,20 +107,19 @@ define('BATCH_SIZE', 100);               // Queue batch size
 Flood-wait handling:
 
 - Detects `429` flood errors from Telegram.
-- Pauses the broadcast, sleeps for the recommended wait time × `FLOOD_WAIT_MULTIPLIER`.
-- Resumes automatically and continues the queue.
+- **Pauses the broadcast and records a `resume_at` timestamp** (recommended wait × `FLOOD_WAIT_MULTIPLIER`). It does **not** `sleep()` inside the request — a later cron tick resumes it automatically once the window elapses. This keeps every cron run well under PHP's `max_execution_time`.
+- Each cron run is **time-boxed** (`CRON_TIME_BUDGET`, default 25s) and protected by a **file lock** so overlapping cron invocations never double-send.
+- The live send rate can be changed at runtime from the **⚙️ Settings** menu (stored in the `settings` table, overrides `MESSAGES_PER_MINUTE`).
+
+> Note on throughput: real safe throughput is bounded by Telegram's limits (~30 messages/second globally, far less per-user) and your `MESSAGES_PER_MINUTE` setting. The conservative default (35/min) is deliberately slow to avoid bans; raise it carefully. Do not expect "tens of thousands per hour" without risking flood limits.
 
 ### Button click tracking & analytics
 
-- Whenever a user clicks an inline button created by a broadcast, the bot can store a record in the `clicks` table:
-  - `broadcast_id`
-  - `user_id`
-  - `button_data`
-  - `clicked_at`
-- The **Statistics** and **History** sections show:
-  - Broadcast counts (total, sent, failed).
-  - Per-source user counts.
-  - High-level performance of past campaigns.
+- Inline buttons whose `callback_data` is namespaced as `clk_<broadcastId>_<label>` are tracked: each press is recorded in the `clicks` table (`broadcast_id`, `user_id`, `button_data`, `clicked_at`).
+- **Broadcasts History → 📈 Analytics** shows a per-broadcast breakdown:
+  - Delivery rate (sent vs failed).
+  - Total clicks, unique clickers, and **CTR** (unique clicks ÷ sent).
+- The **Statistics** section shows global counts and per-source user counts.
 
 ### Blacklist & unsubscribe
 
@@ -124,12 +136,13 @@ The bot uses a local SQLite database with these core tables:
 - `users` – collected users (one row per Telegram `user_id`).
 - `sources` – groups/channels that feed users.
 - `broadcasts` – broadcast campaigns and summary stats.
-- `queue` – per-user messages to send for each broadcast.
-- `failed` – messages that failed and are scheduled for retry.
-- `blacklist` – users who should no longer be contacted.
+- `queue` – per-user messages to send for each broadcast (statuses: `pending`, `retry`, `sent`, `failed`).
+- `failed` – legacy retry-log table (retries are now driven inline by the `queue` table).
+- `blacklist` – users who should no longer be contacted (unsubscribed or permanently failing).
 - `clicks` – button click logs.
-- `settings` – key/value configuration overrides.
+- `settings` – key/value configuration overrides (e.g. live send rate).
 - `user_states` – owner conversation state for multi-step flows.
+- `templates` – saved reusable broadcast messages.
 
 SQLite is tuned with WAL mode and reasonable performance pragmas for high write throughput.
 
@@ -150,11 +163,23 @@ SQLite is tuned with WAL mode and reasonable performance pragmas for high write 
 
 ## Configuration
 
-At the top of `telegram-send-message-bot.php`:
+**Recommended:** keep secrets out of the source file. Copy `config.local.example.php` to `config.local.php` (git-ignored) and define your real values there — the bot loads it automatically before applying defaults. You can also use environment variables (`BOT_TOKEN`, `CRON_SECRET`, `WEBHOOK_SECRET`).
 
 ```php
-define('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE'); // Get from @BotFather
-define('OWNER_IDS', [123456789, 987654321]); // Array of owner Telegram IDs
+// config.local.php
+define('BOT_TOKEN', '123456:REAL_TOKEN');
+define('OWNER_IDS', [123456789]);
+define('CRON_SECRET', 'long-random-string');     // gates ?setup / ?cron / ?stats
+define('WEBHOOK_SECRET', 'long-random-string');  // validates Telegram webhook calls
+```
+
+The defaults at the top of `telegram-send-message-bot.php`:
+
+```php
+if (!defined('BOT_TOKEN'))   define('BOT_TOKEN', getenv('BOT_TOKEN') ?: 'YOUR_BOT_TOKEN_HERE');
+if (!defined('OWNER_IDS'))   define('OWNER_IDS', [123456789, 987654321]);
+if (!defined('CRON_SECRET'))    define('CRON_SECRET', getenv('CRON_SECRET') ?: 'change-me-cron-secret');
+if (!defined('WEBHOOK_SECRET')) define('WEBHOOK_SECRET', getenv('WEBHOOK_SECRET') ?: 'change-me-webhook-secret');
 
 define('DB_FILE', __DIR__ . '/database.sqlite');
 define('TIMEZONE', 'UTC');          // Your timezone
@@ -241,50 +266,51 @@ Adjust the broadcast safety constants according to your risk tolerance and bot s
    Visit the setup URL in your browser:
 
    ```text
-   https://yourdomain.com/telegram-send-message-bot.php?setup=1
+   https://yourdomain.com/telegram-send-message-bot.php?setup=1&key=YOUR_CRON_SECRET
    ```
 
-   If successful, you will see:
+   The `key` must match `CRON_SECRET`, otherwise the endpoint returns `403`. If successful, you will see:
 
    - Webhook URL.
    - Database path.
    - A suggested cron line, for example:
 
    ```text
-   * * * * * curl -s "https://yourdomain.com/telegram-send-message-bot.php?cron=1" > /dev/null
+   * * * * * curl -s "https://yourdomain.com/telegram-send-message-bot.php?cron=1&key=YOUR_CRON_SECRET" > /dev/null
    ```
 
-   The setup endpoint also calls `setWebhook()` with the current script URL, registering the webhook with Telegram.
+   The setup endpoint also calls `setWebhook()` with the current script URL **and a `secret_token`**, so Telegram includes the `X-Telegram-Bot-Api-Secret-Token` header on every webhook call; the bot rejects any webhook request whose header doesn't match `WEBHOOK_SECRET`.
 
 5. **Configure cron**
 
    Add the suggested cron job on your server (as `root` or the appropriate user):
 
    ```bash
-   * * * * * curl -s "https://yourdomain.com/telegram-send-message-bot.php?cron=1" > /dev/null 2>&1
+   * * * * * curl -s "https://yourdomain.com/telegram-send-message-bot.php?cron=1&key=YOUR_CRON_SECRET" > /dev/null 2>&1
    ```
 
-   Cron does the heavy lifting:
+   Each cron run calls `processQueue()`, which (under a file lock and time budget):
 
-   - `processQueue()` – process pending queue items for active broadcasts.
-   - `retryFailed()` – retry failed messages according to their schedule.
+   - Promotes due scheduled broadcasts and resumes paused ones whose flood-wait elapsed.
+   - Sends a time-boxed batch of pending/retry-due queue items.
+   - Handles retries inline (queue status `retry` + exponential `next_retry` backoff) and blacklists permanently-failing users.
 
 ---
 
 ## HTTP Endpoints
 
-The script exposes a few simple endpoints:
+The script exposes a few simple endpoints. **`setup`, `cron`, and `stats` require `&key=YOUR_CRON_SECRET`** and return `403` without it.
 
-- `?setup=1`  
-  Initialize the database, register webhook, and show cron instructions.
+- `?setup=1&key=...`  
+  Initialize the database, register webhook (with secret token), and show cron instructions.
 
-- `?cron=1`  
-  Process the broadcast queue and retries; used by server cron.
+- `?cron=1&key=...`  
+  Process the broadcast queue; used by server cron.
 
 - `?health=1` or `?health`  
-  Health check; responds with `OK`.
+  Health check; responds with `OK` (no secret required, leaks nothing).
 
-- `?stats=1` or `?stats`  
+- `?stats=1&key=...`  
   Returns a small JSON payload with aggregate stats:
 
   ```json
@@ -329,9 +355,11 @@ Webhook calls from Telegram (no query parameters) are also handled by this file.
 
    - The bot shows:
      - Number of target users.
-     - Estimated time based on `MESSAGES_PER_MINUTE`.
+     - Estimated time based on the current send rate.
      - A randomly generated confirmation code.
-   - Type the confirmation code in chat to start broadcasting.
+   - Type the confirmation code in chat to start broadcasting **now**, or schedule it:
+     - `CODE in 30m` / `CODE in 2h` / `CODE in 1d`
+     - `CODE at 2026-06-19 10:00`
    - The broadcast is inserted into the queue and processed by cron.
 
 4. **Monitor progress**
@@ -344,16 +372,12 @@ Webhook calls from Telegram (no query parameters) are also handled by this file.
 5. **Export users**
 
    - Tap `💾 Export Users`.
-   - Depending on implementation, the bot can send:
-     - CSV file.
-     - JSON file.
+   - The bot sends a CSV file (with formula-injection protection on text fields).
    - Useful for external analytics or backup.
 
 6. **Manage settings**
 
-   - Tap `⚙️ Settings` to:
-     - Adjust performance parameters (if exposed).
-     - Change default behavior like collection options.
+   - Tap `⚙️ Settings` to change the live **send rate** (messages/minute), stored in the `settings` table and applied immediately to running broadcasts.
 
 ### For regular users (recipients)
 
@@ -366,12 +390,20 @@ Webhook calls from Telegram (no query parameters) are also handled by this file.
 ## Security & Best Practices
 
 - Always serve the bot via **HTTPS**.
-- Keep `BOT_TOKEN` private:
-  - Never commit it to public repositories.
-  - Use environment variables or private include files if you refactor.
-- Protect your SQLite and log files:
-  - Place them in directories not directly exposed through the web server, when possible.
-  - Use restrictive file permissions.
+- Keep `BOT_TOKEN`, `CRON_SECRET`, and `WEBHOOK_SECRET` private:
+  - They live in `config.local.php` (git-ignored) or environment variables — never commit them.
+  - The bundled `.gitignore` excludes `config.local.php`, `*.sqlite*`, `bot.log`, `cron.lock`, and `*.csv`.
+- The management endpoints (`?setup`, `?cron`, `?stats`) require the `key` secret; webhooks require the matching `X-Telegram-Bot-Api-Secret-Token` header.
+- Protect your SQLite and log files from direct web access — they sit next to the script. Block them at the web-server level, e.g. nginx:
+  ```nginx
+  location ~* \.(sqlite|sqlite-wal|sqlite-shm|log|lock)$ { deny all; }
+  ```
+  or Apache `.htaccess`:
+  ```apache
+  <FilesMatch "\.(sqlite|sqlite-wal|sqlite-shm|log|lock)$">
+    Require all denied
+  </FilesMatch>
+  ```
 - Limit `OWNER_IDS` to trusted accounts:
   - Owners have full power to send messages to all collected users.
 - Monitor logs for:

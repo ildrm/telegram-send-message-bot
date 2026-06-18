@@ -1,0 +1,16 @@
+# Local secrets / config
+config.local.php
+
+# Runtime data — never commit user data or logs
+database.sqlite
+database.sqlite-shm
+database.sqlite-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+bot.log
+cron.lock
+
+# Exports
+users_*.csv
+*.csv

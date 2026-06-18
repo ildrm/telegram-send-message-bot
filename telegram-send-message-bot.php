@@ -24,11 +24,25 @@ declare(strict_types=1);
 // CONFIGURATION
 // ============================================================================
 
-define('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE'); // Get from @BotFather
-define('OWNER_IDS', [123456789, 987654321]); // Array of owner Telegram IDs
-define('DB_FILE', __DIR__ . '/database.sqlite');
-define('TIMEZONE', 'UTC'); // Your timezone
-define('LOG_FILE', __DIR__ . '/bot.log');
+// Secrets can be provided via environment / a non-committed config.local.php.
+// If config.local.php exists it is loaded first and may define any of the constants below.
+if (is_file(__DIR__ . '/config.local.php')) {
+    require __DIR__ . '/config.local.php';
+}
+
+if (!defined('BOT_TOKEN'))   define('BOT_TOKEN', getenv('BOT_TOKEN') ?: 'YOUR_BOT_TOKEN_HERE'); // Get from @BotFather
+if (!defined('OWNER_IDS'))   define('OWNER_IDS', [123456789, 987654321]); // Array of owner Telegram IDs
+if (!defined('DB_FILE'))     define('DB_FILE', __DIR__ . '/database.sqlite');
+if (!defined('TIMEZONE'))    define('TIMEZONE', 'UTC'); // Your timezone
+if (!defined('LOG_FILE'))    define('LOG_FILE', __DIR__ . '/bot.log');
+if (!defined('LOCK_FILE'))   define('LOCK_FILE', __DIR__ . '/cron.lock');
+
+// Shared secrets — CHANGE THESE. Required to call ?setup / ?cron / ?stats and to validate webhooks.
+if (!defined('CRON_SECRET'))    define('CRON_SECRET', getenv('CRON_SECRET') ?: 'change-me-cron-secret');
+if (!defined('WEBHOOK_SECRET')) define('WEBHOOK_SECRET', getenv('WEBHOOK_SECRET') ?: 'change-me-webhook-secret');
+
+// Max wall-clock seconds a single cron run will spend sending, so it never exceeds PHP's limit.
+if (!defined('CRON_TIME_BUDGET')) define('CRON_TIME_BUDGET', 25);
 
 // Broadcast safety settings
 define('MESSAGES_PER_MINUTE', 35); // Safe default: 35 msg/min
@@ -123,10 +137,104 @@ function calculateETA(int $remaining, float $messagesPerMinute): string {
 }
 
 /**
+ * Parse a schedule spec into a future unix timestamp, or null if invalid/in the past.
+ * Accepts: "in 30m", "in 2h", "in 1d", "at 2026-06-19 10:00".
+ */
+function parseScheduleSpec(string $spec): ?int {
+    $spec = trim(strtolower($spec));
+
+    if (preg_match('/^in\s+(\d+)\s*(m|min|h|hour|hours|d|day|days)$/', $spec, $m)) {
+        $n = (int)$m[1];
+        $unit = $m[2];
+        $seconds = match(true) {
+            str_starts_with($unit, 'm') => $n * 60,
+            str_starts_with($unit, 'h') => $n * 3600,
+            str_starts_with($unit, 'd') => $n * 86400,
+            default => 0,
+        };
+        return $seconds > 0 ? time() + $seconds : null;
+    }
+
+    if (preg_match('/^at\s+(.+)$/', $spec, $m)) {
+        $ts = strtotime($m[1]);
+        return ($ts !== false && $ts > time()) ? $ts : null;
+    }
+
+    return null;
+}
+
+/**
  * Sanitize filename for export
  */
 function sanitizeFilename(string $filename): string {
     return preg_replace('/[^a-zA-Z0-9_-]/', '_', $filename);
+}
+
+/**
+ * Read a setting from the settings table, falling back to a default.
+ */
+function getSetting(string $key, ?string $default = null): ?string {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT value FROM settings WHERE key = :key");
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return $row ? $row['value'] : $default;
+}
+
+/**
+ * Write a setting to the settings table.
+ */
+function setSetting(string $key, string $value): void {
+    $db = getDB();
+    $stmt = $db->prepare("INSERT INTO settings (key, value, updated_at) VALUES (:key, :value, :ts)
+                          ON CONFLICT(key) DO UPDATE SET value = :value, updated_at = :ts");
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/**
+ * Effective send rate (msg/min): DB override wins over the MESSAGES_PER_MINUTE constant.
+ */
+function effectiveRate(): int {
+    $v = (int)getSetting('messages_per_minute', (string)MESSAGES_PER_MINUTE);
+    return $v > 0 ? $v : MESSAGES_PER_MINUTE;
+}
+
+/**
+ * Add a user to the blacklist (e.g. blocked the bot / deactivated).
+ */
+function blacklistUser(int $userId, string $reason): void {
+    $db = getDB();
+    $stmt = $db->prepare("INSERT OR IGNORE INTO blacklist (user_id, reason, added_at) VALUES (:uid, :reason, :ts)");
+    $stmt->bindValue(':uid', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/**
+ * True for Telegram errors that will never succeed on retry (user blocked the bot,
+ * deactivated, never started it, etc.). Such users should be blacklisted, not retried.
+ */
+function isPermanentSendError(string $description): bool {
+    $d = strtolower($description);
+    foreach ([
+        'bot was blocked',
+        'user is deactivated',
+        'chat not found',
+        "bot can't initiate conversation",
+        'bot can’t initiate conversation',
+        'user not found',
+        'have no rights to send',
+        'peer_id_invalid',
+    ] as $needle) {
+        if (str_contains($d, strtolower($needle))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -152,9 +260,7 @@ function initDatabase(): void {
         last_seen INTEGER,
         is_bot INTEGER DEFAULT 0,
         started_bot INTEGER DEFAULT 0,
-        INDEX(source_id),
-        INDEX(collected_at),
-        INDEX(started_bot)
+        subscribed_at INTEGER
     )");
     
     // Sources table - groups/channels where bot is admin
@@ -167,8 +273,7 @@ function initDatabase(): void {
         member_count INTEGER DEFAULT 0,
         added_at INTEGER NOT NULL,
         last_sync INTEGER,
-        is_active INTEGER DEFAULT 1,
-        INDEX(is_active)
+        is_active INTEGER DEFAULT 1
     )");
     
     // Broadcasts table - broadcast campaigns
@@ -187,8 +292,8 @@ function initDatabase(): void {
         completed_at INTEGER,
         created_at INTEGER NOT NULL,
         confirmation_code TEXT,
-        INDEX(status),
-        INDEX(scheduled_at)
+        resume_at INTEGER,
+        variant_group TEXT
     )");
     
     // Queue table - individual messages to send
@@ -201,9 +306,7 @@ function initDatabase(): void {
         last_attempt INTEGER,
         error_message TEXT,
         sent_at INTEGER,
-        INDEX(broadcast_id),
-        INDEX(status),
-        INDEX(user_id)
+        next_retry INTEGER
     )");
     
     // Failed messages table - for retry tracking
@@ -214,9 +317,7 @@ function initDatabase(): void {
         error_message TEXT,
         retry_count INTEGER DEFAULT 0,
         next_retry INTEGER,
-        failed_at INTEGER NOT NULL,
-        INDEX(broadcast_id),
-        INDEX(next_retry)
+        failed_at INTEGER NOT NULL
     )");
     
     // Blacklist table - users who stopped the bot
@@ -224,8 +325,7 @@ function initDatabase(): void {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER UNIQUE NOT NULL,
         reason TEXT,
-        added_at INTEGER NOT NULL,
-        INDEX(user_id)
+        added_at INTEGER NOT NULL
     )");
     
     // Clicks table - track button clicks
@@ -234,9 +334,7 @@ function initDatabase(): void {
         broadcast_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         button_data TEXT,
-        clicked_at INTEGER NOT NULL,
-        INDEX(broadcast_id),
-        INDEX(user_id)
+        clicked_at INTEGER NOT NULL
     )");
     
     // Settings table - bot configuration
@@ -253,7 +351,33 @@ function initDatabase(): void {
         data TEXT,
         updated_at INTEGER NOT NULL
     )");
-    
+
+    // Templates table - reusable saved messages
+    $db->exec("CREATE TABLE IF NOT EXISTS templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        message_data TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )");
+
+    // Indexes (SQLite requires these as separate statements, not inline in CREATE TABLE)
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_users_source ON users(source_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_users_collected ON users(collected_at)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_users_started ON users(started_bot)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_sources_active ON sources(is_active)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_broadcasts_scheduled ON broadcasts(scheduled_at)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_queue_broadcast ON queue(broadcast_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(broadcast_id, status, next_retry)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_queue_user ON queue(user_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_failed_broadcast ON failed(broadcast_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_failed_retry ON failed(next_retry)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklist(user_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_clicks_broadcast ON clicks(broadcast_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_clicks_user ON clicks(user_id)");
+
     logMessage('Database initialized successfully');
 }
 
@@ -282,6 +406,11 @@ function getDB(): SQLite3 {
  * Make Telegram API request
  */
 function apiRequest(string $method, array $params = []): ?array {
+    // Optional transport override (for tests / dry-run). When set, no network call is made.
+    if (isset($GLOBALS['__api_transport']) && is_callable($GLOBALS['__api_transport'])) {
+        return ($GLOBALS['__api_transport'])($method, $params);
+    }
+
     $url = "https://api.telegram.org/bot" . BOT_TOKEN . "/{$method}";
     
     $ch = curl_init($url);
@@ -326,14 +455,20 @@ function sendMessage(int $chatId, array $messageData): ?array {
     };
     
     $params = ['chat_id' => $chatId];
-    
-    // Add message-specific parameters
+
+    // Add message-specific parameters. 'type' is our internal routing key; for polls
+    // the actual Telegram "type" (regular/quiz) is carried as 'type_poll'.
     foreach ($messageData as $key => $value) {
-        if ($key !== 'type') {
-            $params[$key] = $value;
+        if ($key === 'type') {
+            continue;
         }
+        if ($key === 'type_poll') {
+            $params['type'] = $value;
+            continue;
+        }
+        $params[$key] = $value;
     }
-    
+
     return apiRequest($method, $params);
 }
 
@@ -372,9 +507,10 @@ function answerCallback(string $callbackId, string $text = '', bool $alert = fal
 function setWebhook(string $url): bool {
     $result = apiRequest('setWebhook', [
         'url' => $url,
+        'secret_token' => WEBHOOK_SECRET,
         'allowed_updates' => ['message', 'callback_query', 'chat_member', 'my_chat_member']
     ]);
-    
+
     return $result && $result['ok'];
 }
 
@@ -415,6 +551,34 @@ function addUser(int $userId, ?string $username, ?string $firstName, ?string $la
     $stmt->bindValue(':last_seen', $now, SQLITE3_INTEGER);
     
     $stmt->execute();
+}
+
+/**
+ * Record a user who started/DM'd the bot. Upserts so DM-only users are captured
+ * (not just members collected from groups) and marks consent for opt-in broadcasts.
+ */
+function recordStarter(array $from): void {
+    $db = getDB();
+    $now = time();
+    $stmt = $db->prepare("INSERT INTO users (user_id, username, first_name, last_name, source_id, source_type, collected_at, last_seen, is_bot, started_bot, subscribed_at)
+                          VALUES (:uid, :un, :fn, :ln, 0, 'direct', :ts, :ts, :bot, 1, :ts)
+                          ON CONFLICT(user_id) DO UPDATE SET
+                          username = :un,
+                          first_name = :fn,
+                          last_name = :ln,
+                          last_seen = :ts,
+                          started_bot = 1,
+                          subscribed_at = COALESCE(subscribed_at, :ts)");
+    $stmt->bindValue(':uid', (int)$from['id'], SQLITE3_INTEGER);
+    $stmt->bindValue(':un', $from['username'] ?? null, SQLITE3_TEXT);
+    $stmt->bindValue(':fn', $from['first_name'] ?? null, SQLITE3_TEXT);
+    $stmt->bindValue(':ln', $from['last_name'] ?? null, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', $now, SQLITE3_INTEGER);
+    $stmt->bindValue(':bot', !empty($from['is_bot']) ? 1 : 0, SQLITE3_INTEGER);
+    $stmt->execute();
+
+    // A returning starter is no longer unsubscribed.
+    $db->exec("DELETE FROM blacklist WHERE user_id = " . (int)$from['id'] . " AND reason = 'user_request'");
 }
 
 /**
@@ -635,136 +799,175 @@ function populateQueue(int $broadcastId, ?string $filter): void {
 }
 
 /**
- * Process broadcast queue (called by cron)
+ * Process broadcast queue (called by cron).
+ *
+ * Designed to be safe under a once-per-minute cron:
+ *  - A non-blocking file lock prevents two overlapping runs from double-sending.
+ *  - Work is time-boxed (CRON_TIME_BUDGET) so a run always finishes within PHP's limit.
+ *  - On a flood-wait the broadcast is paused with a resume_at timestamp instead of sleep().
+ *  - Retriable failures move the queue row to 'retry' with a backoff in next_retry;
+ *    permanent failures (blocked/deactivated/never-started) blacklist the user immediately.
  */
 function processQueue(): void {
     $db = getDB();
-    
-    // Find active broadcasts
-    $result = $db->query("SELECT * FROM broadcasts 
-                          WHERE status IN ('running', 'scheduled') 
-                          AND (scheduled_at IS NULL OR scheduled_at <= " . time() . ")
-                          ORDER BY created_at ASC LIMIT 1");
-    
-    $broadcast = $result->fetchArray(SQLITE3_ASSOC);
-    
-    if (!$broadcast) {
-        return; // No active broadcasts
+
+    // ---- Concurrency lock: bail out if another run is in progress ----
+    $lock = @fopen(LOCK_FILE, 'c');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if ($lock) { fclose($lock); }
+        return; // Another cron run holds the lock
     }
-    
-    $broadcastId = $broadcast['id'];
-    
-    // Update status to running if it was scheduled
-    if ($broadcast['status'] === 'scheduled') {
-        $db->exec("UPDATE broadcasts SET status = 'running', started_at = " . time() . " WHERE id = {$broadcastId}");
-    }
-    
-    // Get pending messages from queue
-    $queueResult = $db->query("SELECT * FROM queue 
-                               WHERE broadcast_id = {$broadcastId} 
-                               AND status = 'pending' 
-                               LIMIT " . BATCH_SIZE);
-    
-    $messageData = json_decode($broadcast['message_data'], true);
-    $sentCount = 0;
-    $failedCount = 0;
-    
-    while ($queueItem = $queueResult->fetchArray(SQLITE3_ASSOC)) {
-        $userId = $queueItem['user_id'];
-        
-        // Send message
-        $result = sendMessage($userId, $messageData);
-        
-        if ($result && $result['ok']) {
-            // Success
-            $db->exec("UPDATE queue SET status = 'sent', sent_at = " . time() . " WHERE id = {$queueItem['id']}");
-            $sentCount++;
-        } else {
-            // Failed
-            $errorMsg = $result['description'] ?? 'Unknown error';
-            
-            // Check for flood wait
-            $floodWait = parseFloodWait($errorMsg);
-            
-            if ($floodWait > 0) {
-                logMessage("Flood wait detected: {$floodWait}s - Pausing broadcast #{$broadcastId}", 'WARNING');
-                
-                // Pause broadcast and schedule resume
-                $db->exec("UPDATE broadcasts SET status = 'paused' WHERE id = {$broadcastId}");
-                
-                // Sleep and resume
-                sleep($floodWait);
-                $db->exec("UPDATE broadcasts SET status = 'running' WHERE id = {$broadcastId}");
-                
-                continue; // Retry this message
-            }
-            
-            // Handle other errors
-            $retryCount = $queueItem['retry_count'] + 1;
-            
-            if ($retryCount < MAX_RETRIES) {
-                // Schedule retry with exponential backoff
-                $nextRetry = time() + (RETRY_BACKOFF_BASE ** $retryCount);
-                
-                $stmt = $db->prepare("UPDATE queue SET retry_count = :retry_count, last_attempt = :last_attempt, error_message = :error_message WHERE id = :id");
-                $stmt->bindValue(':retry_count', $retryCount, SQLITE3_INTEGER);
-                $stmt->bindValue(':last_attempt', time(), SQLITE3_INTEGER);
-                $stmt->bindValue(':error_message', $errorMsg, SQLITE3_TEXT);
-                $stmt->bindValue(':id', $queueItem['id'], SQLITE3_INTEGER);
-                $stmt->execute();
-                
-                // Add to failed table for retry
-                $stmt = $db->prepare("INSERT INTO failed (broadcast_id, user_id, error_message, retry_count, next_retry, failed_at)
-                                      VALUES (:broadcast_id, :user_id, :error_message, :retry_count, :next_retry, :failed_at)");
-                $stmt->bindValue(':broadcast_id', $broadcastId, SQLITE3_INTEGER);
-                $stmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
-                $stmt->bindValue(':error_message', $errorMsg, SQLITE3_TEXT);
-                $stmt->bindValue(':retry_count', $retryCount, SQLITE3_INTEGER);
-                $stmt->bindValue(':next_retry', $nextRetry, SQLITE3_INTEGER);
-                $stmt->bindValue(':failed_at', time(), SQLITE3_INTEGER);
-                $stmt->execute();
-            } else {
-                // Max retries reached
-                $db->exec("UPDATE queue SET status = 'failed', error_message = " . $db->escapeString($errorMsg) . " WHERE id = {$queueItem['id']}");
-                $failedCount++;
-            }
+
+    try {
+        $now = time();
+
+        // Resume any paused broadcasts whose flood-wait window has elapsed.
+        $db->exec("UPDATE broadcasts SET status = 'running', resume_at = NULL
+                   WHERE status = 'paused' AND resume_at IS NOT NULL AND resume_at <= {$now}");
+
+        // Promote scheduled broadcasts that are due.
+        $db->exec("UPDATE broadcasts SET status = 'running', started_at = COALESCE(started_at, {$now})
+                   WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= {$now}");
+
+        // Find one active broadcast to work on.
+        $broadcast = $db->querySingle("SELECT * FROM broadcasts
+                                       WHERE status = 'running'
+                                       ORDER BY created_at ASC LIMIT 1", true);
+
+        if (!$broadcast) {
+            return; // Nothing to do (finally releases the lock)
         }
-        
-        // Smart delay between messages
-        usleep((int)(getSmartDelay() * 1000000));
-    }
-    
-    // Update broadcast stats
-    $db->exec("UPDATE broadcasts SET 
-               sent_count = sent_count + {$sentCount},
-               failed_count = failed_count + {$failedCount}
-               WHERE id = {$broadcastId}");
-    
-    // Check if broadcast is complete
-    $remaining = $db->querySingle("SELECT COUNT(*) FROM queue WHERE broadcast_id = {$broadcastId} AND status = 'pending'");
-    
-    if ($remaining == 0) {
-        $db->exec("UPDATE broadcasts SET status = 'completed', completed_at = " . time() . " WHERE id = {$broadcastId}");
-        logMessage("Broadcast #{$broadcastId} completed: {$broadcast['sent_count']} sent, {$broadcast['failed_count']} failed");
+
+        $broadcastId = (int)$broadcast['id'];
+        $messageData = json_decode($broadcast['message_data'], true);
+        $rate        = effectiveRate();
+        $sentCount   = 0;
+        $failedCount = 0;
+        $startTime   = microtime(true);
+
+        // Pull a batch of due items (pending, or retry whose backoff has elapsed).
+        $items = [];
+        $res = $db->query("SELECT * FROM queue
+                           WHERE broadcast_id = {$broadcastId}
+                           AND (status = 'pending' OR (status = 'retry' AND next_retry <= {$now}))
+                           ORDER BY id ASC LIMIT " . BATCH_SIZE);
+        while ($row = $res->fetchArray(SQLITE3_ASSOC)) {
+            $items[] = $row;
+        }
+
+        $sentStmt   = $db->prepare("UPDATE queue SET status='sent', sent_at=:ts WHERE id=:id");
+        $retryStmt  = $db->prepare("UPDATE queue SET status='retry', retry_count=:rc, last_attempt=:ts, next_retry=:nr, error_message=:err WHERE id=:id");
+        $failStmt   = $db->prepare("UPDATE queue SET status='failed', last_attempt=:ts, error_message=:err WHERE id=:id");
+
+        foreach ($items as $queueItem) {
+            // Stay within the time budget so the request never exceeds PHP's max_execution_time.
+            if ((microtime(true) - $startTime) > CRON_TIME_BUDGET) {
+                break;
+            }
+
+            $userId = (int)$queueItem['user_id'];
+            $result = sendMessage($userId, $messageData);
+
+            if ($result && ($result['ok'] ?? false)) {
+                $sentStmt->reset();
+                $sentStmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+                $sentStmt->bindValue(':id', $queueItem['id'], SQLITE3_INTEGER);
+                $sentStmt->execute();
+                $sentCount++;
+            } else {
+                $errorMsg  = $result['description'] ?? 'Unknown error';
+                $floodWait = parseFloodWait($errorMsg);
+
+                if ($floodWait > 0) {
+                    // Pause and schedule resume — do NOT sleep inside the request.
+                    $resumeAt = time() + $floodWait;
+                    $db->exec("UPDATE broadcasts SET status='paused', resume_at={$resumeAt} WHERE id={$broadcastId}");
+                    logMessage("Flood wait {$floodWait}s on broadcast #{$broadcastId}; paused until {$resumeAt}", 'WARNING');
+                    break; // Leave this item as-is; it will be retried after resume
+                }
+
+                if (isPermanentSendError($errorMsg)) {
+                    // Will never succeed — blacklist and stop retrying this user.
+                    blacklistUser($userId, 'send_error: ' . substr($errorMsg, 0, 100));
+                    $failStmt->reset();
+                    $failStmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+                    $failStmt->bindValue(':err', $errorMsg, SQLITE3_TEXT);
+                    $failStmt->bindValue(':id', $queueItem['id'], SQLITE3_INTEGER);
+                    $failStmt->execute();
+                    $failedCount++;
+                } else {
+                    $retryCount = (int)$queueItem['retry_count'] + 1;
+                    if ($retryCount < MAX_RETRIES) {
+                        $nextRetry = time() + (int)(RETRY_BACKOFF_BASE ** $retryCount);
+                        $retryStmt->reset();
+                        $retryStmt->bindValue(':rc', $retryCount, SQLITE3_INTEGER);
+                        $retryStmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+                        $retryStmt->bindValue(':nr', $nextRetry, SQLITE3_INTEGER);
+                        $retryStmt->bindValue(':err', $errorMsg, SQLITE3_TEXT);
+                        $retryStmt->bindValue(':id', $queueItem['id'], SQLITE3_INTEGER);
+                        $retryStmt->execute();
+                    } else {
+                        $failStmt->reset();
+                        $failStmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+                        $failStmt->bindValue(':err', $errorMsg, SQLITE3_TEXT);
+                        $failStmt->bindValue(':id', $queueItem['id'], SQLITE3_INTEGER);
+                        $failStmt->execute();
+                        $failedCount++;
+                    }
+                }
+            }
+
+            // Smart delay between messages (rate-limited, with jitter).
+            usleep((int)(getSmartDelay() * 1000000));
+        }
+
+        // Persist counters for this run.
+        if ($sentCount > 0 || $failedCount > 0) {
+            $db->exec("UPDATE broadcasts SET
+                       sent_count = sent_count + {$sentCount},
+                       failed_count = failed_count + {$failedCount}
+                       WHERE id = {$broadcastId}");
+        }
+
+        // Complete when nothing is left pending or awaiting retry.
+        $remaining = (int)$db->querySingle("SELECT COUNT(*) FROM queue
+                                            WHERE broadcast_id = {$broadcastId}
+                                            AND status IN ('pending', 'retry')");
+        if ($remaining === 0) {
+            $db->exec("UPDATE broadcasts SET status='completed', completed_at=" . time() . " WHERE id={$broadcastId}");
+            $totSent   = (int)$db->querySingle("SELECT sent_count FROM broadcasts WHERE id={$broadcastId}");
+            $totFailed = (int)$db->querySingle("SELECT failed_count FROM broadcasts WHERE id={$broadcastId}");
+            logMessage("Broadcast #{$broadcastId} completed: {$totSent} sent, {$totFailed} failed");
+            notifyBroadcastComplete($broadcast, $totSent, $totFailed);
+        }
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
     }
 }
 
 /**
- * Retry failed messages
+ * Notify the broadcast owner that a campaign finished.
+ */
+function notifyBroadcastComplete(array $broadcast, int $sent, int $failed): void {
+    sendMessage((int)$broadcast['owner_id'], [
+        'type' => 'text',
+        'parse_mode' => 'HTML',
+        'text' => "✅ <b>Broadcast #{$broadcast['id']} completed</b>\n\n"
+                . "✅ Sent: " . formatNumber($sent) . "\n"
+                . "❌ Failed: " . formatNumber($failed),
+    ]);
+}
+
+/**
+ * Legacy retry sweep retained for compatibility.
+ *
+ * Retries are now handled inline by processQueue() via the queue 'retry' status and
+ * next_retry backoff, so the standalone `failed` table is no longer the retry driver.
+ * This call is a no-op kept so existing cron setups don't break.
  */
 function retryFailed(): void {
-    $db = getDB();
-    
-    $now = time();
-    $result = $db->query("SELECT * FROM failed WHERE next_retry <= {$now} AND retry_count < " . MAX_RETRIES);
-    
-    while ($failed = $result->fetchArray(SQLITE3_ASSOC)) {
-        // Reset queue item to pending
-        $db->exec("UPDATE queue SET status = 'pending' WHERE broadcast_id = {$failed['broadcast_id']} AND user_id = {$failed['user_id']}");
-        
-        // Remove from failed table
-        $db->exec("DELETE FROM failed WHERE id = {$failed['id']}");
-    }
+    // Intentionally empty — see processQueue() retry handling.
 }
 
 /**
@@ -818,7 +1021,7 @@ function showOwnerMenu(int $chatId): void {
     $keyboard = [
         [['text' => '📤 New Broadcast', 'callback_data' => 'new_broadcast']],
         [['text' => '📊 Statistics', 'callback_data' => 'stats'], ['text' => '📋 Sources', 'callback_data' => 'sources']],
-        [['text' => '📜 Broadcasts History', 'callback_data' => 'history']],
+        [['text' => '📜 Broadcasts History', 'callback_data' => 'history'], ['text' => '📁 Templates', 'callback_data' => 'templates']],
         [['text' => '💾 Export Users', 'callback_data' => 'export']],
         [['text' => '⚙️ Settings', 'callback_data' => 'settings']]
     ];
@@ -912,6 +1115,7 @@ function showHistory(int $chatId, int $messageId): void {
     $text = "📜 <b>Recent Broadcasts</b>\n\n";
     
     $count = 0;
+    $keyboard = [];
     while ($broadcast = $result->fetchArray(SQLITE3_ASSOC)) {
         $count++;
         $status = match($broadcast['status']) {
@@ -922,20 +1126,21 @@ function showHistory(int $chatId, int $messageId): void {
             'cancelled' => '❌',
             default => '⏳'
         };
-        
+
         $text .= "{$status} <b>Broadcast #{$broadcast['id']}</b>\n";
         $text .= "   Status: {$broadcast['status']}\n";
         $text .= "   Total: " . formatNumber($broadcast['total_users']) . "\n";
         $text .= "   Sent: " . formatNumber($broadcast['sent_count']) . " | Failed: " . formatNumber($broadcast['failed_count']) . "\n";
         $text .= "   Created: " . date('Y-m-d H:i', $broadcast['created_at']) . "\n\n";
+        $keyboard[] = [['text' => "📈 #{$broadcast['id']} Analytics", 'callback_data' => 'bstats_' . $broadcast['id']]];
     }
-    
+
     if ($count === 0) {
         $text .= "No broadcasts yet.";
     }
-    
-    $keyboard = [[['text' => '« Back', 'callback_data' => 'menu']]];
-    
+
+    $keyboard[] = [['text' => '« Back', 'callback_data' => 'menu']];
+
     editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $keyboard]);
 }
 
@@ -952,21 +1157,31 @@ function exportUsers(int $chatId): void {
                           WHERE b.user_id IS NULL 
                           ORDER BY u.collected_at DESC");
     
-    $csv = "User ID,Username,First Name,Last Name,Source,Collected At\n";
-    
-    while ($user = $result->fetchArray(SQLITE3_ASSOC)) {
-        $csv .= "\"{$user['user_id']}\",";
-        $csv .= "\"" . ($user['username'] ?? '') . "\",";
-        $csv .= "\"" . ($user['first_name'] ?? '') . "\",";
-        $csv .= "\"" . ($user['last_name'] ?? '') . "\",";
-        $csv .= "\"" . ($user['source'] ?? 'Unknown') . "\",";
-        $csv .= "\"" . date('Y-m-d H:i:s', $user['collected_at']) . "\"\n";
-    }
-    
+    // Guard against CSV/formula injection: a leading = + - @ or tab is neutralized with a quote.
+    $neutralize = function (?string $v): string {
+        $v = (string)$v;
+        if ($v !== '' && in_array($v[0], ['=', '+', '-', '@', "\t", "\r"], true)) {
+            return "'" . $v;
+        }
+        return $v;
+    };
+
     $filename = 'users_' . date('Y-m-d_His') . '.csv';
     $filepath = __DIR__ . '/' . $filename;
-    
-    file_put_contents($filepath, $csv);
+
+    $fh = fopen($filepath, 'w');
+    fputcsv($fh, ['User ID', 'Username', 'First Name', 'Last Name', 'Source', 'Collected At']);
+    while ($user = $result->fetchArray(SQLITE3_ASSOC)) {
+        fputcsv($fh, [
+            (string)$user['user_id'],
+            $neutralize($user['username'] ?? ''),
+            $neutralize($user['first_name'] ?? ''),
+            $neutralize($user['last_name'] ?? ''),
+            $neutralize($user['source'] ?? 'Unknown'),
+            date('Y-m-d H:i:s', $user['collected_at']),
+        ]);
+    }
+    fclose($fh);
     
     // Send as document
     apiRequest('sendDocument', [
@@ -1082,11 +1297,12 @@ function handleMessage(array $message): void {
     $chatId = $message['chat']['id'];
     $userId = $message['from']['id'];
     $text = $message['text'] ?? '';
-    
-    // Mark user as started bot if private chat
+
+    // Mark user as started bot if private chat. Upsert so users who DM the bot
+    // directly (and were never collected from a group) are still captured — these
+    // are the only users a bot is actually allowed to message.
     if ($message['chat']['type'] === 'private') {
-        $db = getDB();
-        $db->exec("UPDATE users SET started_bot = 1 WHERE user_id = {$userId}");
+        recordStarter($message['from']);
     }
     
     // Handle /start command
@@ -1096,7 +1312,8 @@ function handleMessage(array $message): void {
         } else {
             sendMessage($chatId, [
                 'type' => 'text',
-                'text' => "👋 Welcome! This bot is for broadcasting messages.\n\nYou'll receive messages from the bot owner."
+                'text' => "👋 <b>You're subscribed!</b>\n\nYou'll occasionally receive updates here.\n\nSend /stop at any time to unsubscribe.",
+                'parse_mode' => 'HTML',
             ]);
         }
         return;
@@ -1169,6 +1386,7 @@ function handleBroadcastMessage(array $message): void {
         [['text' => "📢 All Users (" . formatNumber($totalUsers) . ")", 'callback_data' => 'target_all']],
         [['text' => '👥 Only Bot Starters', 'callback_data' => 'target_starters']],
         [['text' => '📋 Select Source', 'callback_data' => 'target_source']],
+        [['text' => '💾 Save as Template', 'callback_data' => 'save_template']],
         [['text' => '❌ Cancel', 'callback_data' => 'menu']]
     ];
     
@@ -1187,58 +1405,70 @@ function handleBroadcastMessage(array $message): void {
  * Extract message data for broadcasting
  */
 function extractMessageData(array $message): ?array {
-    if (isset($message['text'])) {
-        $data = ['type' => 'text', 'text' => $message['text']];
-        
-        if (isset($message['entities'])) {
-            $data['entities'] = $message['entities'];
+    // Preserve formatting and inline keyboard where present.
+    $withCaption = function (array $data) use ($message): array {
+        if (isset($message['caption'])) {
+            $data['caption'] = $message['caption'];
         }
-        
+        if (isset($message['caption_entities'])) {
+            $data['caption_entities'] = $message['caption_entities'];
+        }
         if (isset($message['reply_markup'])) {
             $data['reply_markup'] = $message['reply_markup'];
         }
-        
+        return $data;
+    };
+
+    if (isset($message['text'])) {
+        $data = ['type' => 'text', 'text' => $message['text']];
+        if (isset($message['entities'])) {
+            $data['entities'] = $message['entities'];
+        }
+        if (isset($message['reply_markup'])) {
+            $data['reply_markup'] = $message['reply_markup'];
+        }
         return $data;
     }
-    
+
     if (isset($message['photo'])) {
         $photo = end($message['photo']);
-        return [
-            'type' => 'photo',
-            'photo' => $photo['file_id'],
-            'caption' => $message['caption'] ?? '',
-            'reply_markup' => $message['reply_markup'] ?? null
-        ];
+        return $withCaption(['type' => 'photo', 'photo' => $photo['file_id']]);
     }
-    
+
     if (isset($message['video'])) {
-        return [
-            'type' => 'video',
-            'video' => $message['video']['file_id'],
-            'caption' => $message['caption'] ?? '',
-            'reply_markup' => $message['reply_markup'] ?? null
-        ];
+        return $withCaption(['type' => 'video', 'video' => $message['video']['file_id']]);
     }
-    
+
+    if (isset($message['animation'])) {
+        return $withCaption(['type' => 'animation', 'animation' => $message['animation']['file_id']]);
+    }
+
     if (isset($message['document'])) {
-        return [
-            'type' => 'document',
-            'document' => $message['document']['file_id'],
-            'caption' => $message['caption'] ?? '',
-            'reply_markup' => $message['reply_markup'] ?? null
-        ];
+        return $withCaption(['type' => 'document', 'document' => $message['document']['file_id']]);
     }
-    
+
+    if (isset($message['audio'])) {
+        return $withCaption(['type' => 'audio', 'audio' => $message['audio']['file_id']]);
+    }
+
+    if (isset($message['voice'])) {
+        return $withCaption(['type' => 'voice', 'voice' => $message['voice']['file_id']]);
+    }
+
     if (isset($message['poll'])) {
         $poll = $message['poll'];
+        // Options must be an array — the whole API body is JSON-encoded in apiRequest(),
+        // so json_encoding here would double-encode and Telegram would reject it.
         return [
             'type' => 'poll',
             'question' => $poll['question'],
-            'options' => json_encode(array_column($poll['options'], 'text')),
-            'is_anonymous' => $poll['is_anonymous']
+            'options' => array_column($poll['options'], 'text'),
+            'is_anonymous' => $poll['is_anonymous'] ?? true,
+            'type_poll' => $poll['type'] ?? 'regular',
+            'allows_multiple_answers' => $poll['allows_multiple_answers'] ?? false,
         ];
     }
-    
+
     return null;
 }
 
@@ -1249,8 +1479,13 @@ function handleBroadcastConfirmation(array $message, array $stateData): void {
     $chatId = $message['chat']['id'];
     $userId = $message['from']['id'];
     $text = trim($message['text'] ?? '');
-    
-    if ($text !== $stateData['confirmation_code']) {
+
+    // Input is "<CODE>" to send now, or "<CODE> in 30m" / "<CODE> at 2026-06-19 10:00" to schedule.
+    $parts = preg_split('/\s+/', $text, 2);
+    $code = $parts[0] ?? '';
+    $scheduleSpec = trim($parts[1] ?? '');
+
+    if ($code !== $stateData['confirmation_code']) {
         sendMessage($chatId, [
             'type' => 'text',
             'text' => "❌ Incorrect code. Broadcast cancelled.\n\nUse /start to return to menu."
@@ -1258,15 +1493,25 @@ function handleBroadcastConfirmation(array $message, array $stateData): void {
         clearState($userId);
         return;
     }
-    
+
+    $scheduledAt = $scheduleSpec !== '' ? parseScheduleSpec($scheduleSpec) : null;
+    if ($scheduleSpec !== '' && $scheduledAt === null) {
+        sendMessage($chatId, [
+            'type' => 'text',
+            'text' => "❌ Could not understand the schedule time. Use e.g. <code>{$code} in 30m</code> or <code>{$code} at 2026-06-19 10:00</code>.",
+            'parse_mode' => 'HTML',
+        ]);
+        return;
+    }
+
     // Create broadcast
     $broadcastId = createBroadcast(
         $userId,
         $stateData['message_data'],
         $stateData['target_filter'] ?? null,
-        $stateData['scheduled_at'] ?? null
+        $scheduledAt
     );
-    
+
     if ($broadcastId === 0) {
         sendMessage($chatId, [
             'type' => 'text',
@@ -1275,19 +1520,26 @@ function handleBroadcastConfirmation(array $message, array $stateData): void {
         clearState($userId);
         return;
     }
-    
-    // Start broadcast immediately
+
     $db = getDB();
-    $db->exec("UPDATE broadcasts SET status = 'running', started_at = " . time() . " WHERE id = {$broadcastId}");
-    
     $stats = getBroadcastStats($broadcastId);
-    
-    $text = "✅ <b>Broadcast Started!</b>\n\n";
-    $text .= "📊 Broadcast ID: #{$broadcastId}\n";
-    $text .= "👥 Total Users: " . formatNumber($stats['broadcast']['total_users']) . "\n";
-    $text .= "⏱ Estimated Time: " . calculateETA($stats['broadcast']['total_users'], MESSAGES_PER_MINUTE) . "\n\n";
-    $text .= "You'll receive updates as the broadcast progresses.";
-    
+
+    if ($scheduledAt !== null) {
+        // Leave status as 'scheduled' (set by createBroadcast); processQueue promotes it when due.
+        $text = "⏰ <b>Broadcast Scheduled!</b>\n\n";
+        $text .= "📊 Broadcast ID: #{$broadcastId}\n";
+        $text .= "👥 Total Users: " . formatNumber($stats['broadcast']['total_users']) . "\n";
+        $text .= "🕒 Sends at: " . date('Y-m-d H:i', $scheduledAt) . " " . TIMEZONE . "\n";
+    } else {
+        // Start broadcast immediately
+        $db->exec("UPDATE broadcasts SET status = 'running', started_at = " . time() . " WHERE id = {$broadcastId}");
+        $text = "✅ <b>Broadcast Started!</b>\n\n";
+        $text .= "📊 Broadcast ID: #{$broadcastId}\n";
+        $text .= "👥 Total Users: " . formatNumber($stats['broadcast']['total_users']) . "\n";
+        $text .= "⏱ Estimated Time: " . calculateETA($stats['broadcast']['total_users'], effectiveRate()) . "\n\n";
+        $text .= "You'll receive updates as the broadcast progresses.";
+    }
+
     sendMessage($chatId, [
         'type' => 'text',
         'text' => $text,
@@ -1306,14 +1558,21 @@ function handleCallback(array $callback): void {
     $messageId = $callback['message']['message_id'];
     $userId = $callback['from']['id'];
     $data = $callback['data'];
-    
+
     answerCallback($callbackId);
-    
+
+    // Broadcast button clicks (clk_<broadcastId>_<label>) are open to everyone and
+    // recorded for click-through analytics.
+    if (str_starts_with($data, 'clk_')) {
+        recordClick($data, $userId);
+        return;
+    }
+
     // Owner-only callbacks
     if (!isOwner($userId)) {
         return;
     }
-    
+
     // Route callback
     match(true) {
         $data === 'menu' => showOwnerMenu($chatId),
@@ -1322,11 +1581,216 @@ function handleCallback(array $callback): void {
         $data === 'sources' => showSources($chatId, $messageId),
         $data === 'history' => showHistory($chatId, $messageId),
         $data === 'export' => exportUsers($chatId),
+        $data === 'settings' => showSettings($chatId, $messageId),
+        str_starts_with($data, 'set_rate_') => adjustRateSetting($chatId, $messageId, (int)str_replace('set_rate_', '', $data)),
         $data === 'target_all' => handleTargetSelection($chatId, $userId, null),
         $data === 'target_starters' => handleTargetSelection($chatId, $userId, json_encode(['started_bot' => true])),
+        $data === 'target_source' => showSourcePicker($chatId, $messageId),
         str_starts_with($data, 'target_source_') => handleSourceSelection($chatId, $userId, $data),
+        $data === 'test_send' => handleTestSend($chatId, $userId),
+        $data === 'templates' => showTemplates($chatId, $messageId, $userId),
+        $data === 'save_template' => saveTemplateFromState($chatId, $userId),
+        str_starts_with($data, 'tpl_use_') => useTemplate($chatId, $userId, (int)str_replace('tpl_use_', '', $data)),
+        str_starts_with($data, 'bstats_') => showBroadcastAnalytics($chatId, $messageId, (int)str_replace('bstats_', '', $data)),
         default => null
     };
+}
+
+/**
+ * List saved templates with a "use" action each.
+ */
+function showTemplates(int $chatId, int $messageId, int $userId): void {
+    $db = getDB();
+    $res = $db->query("SELECT id, name, message_type FROM templates WHERE owner_id = {$userId} ORDER BY created_at DESC LIMIT 20");
+
+    $text = "📁 <b>Templates</b>\n\n";
+    $keyboard = [];
+    $count = 0;
+    while ($row = $res->fetchArray(SQLITE3_ASSOC)) {
+        $count++;
+        $text .= "{$count}. <b>" . htmlspecialchars($row['name']) . "</b> ({$row['message_type']})\n";
+        $keyboard[] = [['text' => "📤 Use: " . mb_substr($row['name'], 0, 25), 'callback_data' => 'tpl_use_' . $row['id']]];
+    }
+    if ($count === 0) {
+        $text .= "No templates yet. Create a broadcast and press 💾 Save as Template.";
+    }
+    $keyboard[] = [['text' => '« Back', 'callback_data' => 'menu']];
+
+    editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $keyboard]);
+}
+
+/**
+ * Save the message currently being composed (in state) as a reusable template.
+ */
+function saveTemplateFromState(int $chatId, int $userId): void {
+    $state = getState($userId);
+    $messageData = $state['data']['message_data'] ?? null;
+    if ($messageData === null) {
+        sendMessage($chatId, ['type' => 'text', 'text' => '❌ No message to save.']);
+        return;
+    }
+
+    $db = getDB();
+    $name = ucfirst($messageData['type']) . ' ' . date('Y-m-d H:i');
+    $stmt = $db->prepare("INSERT INTO templates (owner_id, name, message_type, message_data, created_at)
+                          VALUES (:owner, :name, :type, :data, :ts)");
+    $stmt->bindValue(':owner', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':name', $name, SQLITE3_TEXT);
+    $stmt->bindValue(':type', $messageData['type'], SQLITE3_TEXT);
+    $stmt->bindValue(':data', json_encode($messageData), SQLITE3_TEXT);
+    $stmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+    $stmt->execute();
+
+    sendMessage($chatId, ['type' => 'text', 'text' => "💾 Saved as template: <b>{$name}</b>", 'parse_mode' => 'HTML']);
+}
+
+/**
+ * Load a template into a new broadcast and jump to target selection.
+ */
+function useTemplate(int $chatId, int $userId, int $templateId): void {
+    $db = getDB();
+    $stmt = $db->prepare("SELECT message_data FROM templates WHERE id = :id AND owner_id = :owner");
+    $stmt->bindValue(':id', $templateId, SQLITE3_INTEGER);
+    $stmt->bindValue(':owner', $userId, SQLITE3_INTEGER);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    if (!$row) {
+        sendMessage($chatId, ['type' => 'text', 'text' => '❌ Template not found.']);
+        return;
+    }
+
+    $messageData = json_decode($row['message_data'], true);
+    $totalUsers = $db->querySingle("SELECT COUNT(DISTINCT user_id) FROM users u LEFT JOIN blacklist b ON u.user_id = b.user_id WHERE b.user_id IS NULL");
+
+    setState($userId, 'selecting_target', ['message_data' => $messageData]);
+
+    sendMessage($chatId, [
+        'type' => 'text',
+        'parse_mode' => 'HTML',
+        'text' => "📊 <b>Select Target Audience</b>\n\nTotal available: <b>" . formatNumber($totalUsers) . "</b>",
+        'reply_markup' => json_encode(['inline_keyboard' => [
+            [['text' => "📢 All Users", 'callback_data' => 'target_all']],
+            [['text' => '👥 Only Bot Starters', 'callback_data' => 'target_starters']],
+            [['text' => '📋 Select Source', 'callback_data' => 'target_source']],
+            [['text' => '❌ Cancel', 'callback_data' => 'menu']],
+        ]]),
+    ]);
+}
+
+/**
+ * Record a broadcast button click for CTR analytics.
+ * Callback data format: clk_<broadcastId>_<label>
+ */
+function recordClick(string $data, int $userId): void {
+    $parts = explode('_', $data, 3);
+    if (count($parts) < 2) return;
+    $broadcastId = (int)$parts[1];
+    $label = $parts[2] ?? '';
+
+    $db = getDB();
+    $stmt = $db->prepare("INSERT INTO clicks (broadcast_id, user_id, button_data, clicked_at) VALUES (:bid, :uid, :label, :ts)");
+    $stmt->bindValue(':bid', $broadcastId, SQLITE3_INTEGER);
+    $stmt->bindValue(':uid', $userId, SQLITE3_INTEGER);
+    $stmt->bindValue(':label', $label, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', time(), SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/**
+ * Show the per-source picker for broadcast targeting.
+ */
+function showSourcePicker(int $chatId, int $messageId): void {
+    $db = getDB();
+    $res = $db->query("SELECT s.chat_id, s.title, COUNT(DISTINCT u.user_id) AS users
+                       FROM sources s
+                       LEFT JOIN users u ON s.chat_id = u.source_id
+                       WHERE s.is_active = 1
+                       GROUP BY s.chat_id ORDER BY users DESC LIMIT 20");
+
+    $keyboard = [];
+    $count = 0;
+    while ($row = $res->fetchArray(SQLITE3_ASSOC)) {
+        $count++;
+        $label = mb_substr($row['title'] ?? 'Source', 0, 30) . ' (' . formatNumber((int)$row['users']) . ')';
+        $keyboard[] = [['text' => $label, 'callback_data' => 'target_source_' . $row['chat_id']]];
+    }
+    $keyboard[] = [['text' => '« Back', 'callback_data' => 'menu']];
+
+    $text = $count > 0
+        ? "📋 <b>Select a source</b>\n\nChoose which group/channel's collected users should receive this broadcast:"
+        : "📋 <b>No active sources</b>\n\nAdd the bot as admin to a group/channel first.";
+
+    editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $keyboard]);
+}
+
+/**
+ * Settings screen — adjust send rate (msg/min) live.
+ */
+function showSettings(int $chatId, int $messageId): void {
+    $rate = effectiveRate();
+    $text = "⚙️ <b>Settings</b>\n\n";
+    $text .= "Send rate: <b>{$rate}</b> messages/min\n";
+    $text .= "Default (code): " . MESSAGES_PER_MINUTE . " msg/min\n\n";
+    $text .= "Lower = safer against Telegram flood limits.";
+
+    $keyboard = [
+        [
+            ['text' => '20/min', 'callback_data' => 'set_rate_20'],
+            ['text' => '35/min', 'callback_data' => 'set_rate_35'],
+            ['text' => '50/min', 'callback_data' => 'set_rate_50'],
+        ],
+        [['text' => '« Back', 'callback_data' => 'menu']],
+    ];
+    editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $keyboard]);
+}
+
+/**
+ * Persist a new send-rate setting and refresh the settings screen.
+ */
+function adjustRateSetting(int $chatId, int $messageId, int $rate): void {
+    if ($rate > 0 && $rate <= 1000) {
+        setSetting('messages_per_minute', (string)$rate);
+    }
+    showSettings($chatId, $messageId);
+}
+
+/**
+ * Send the pending broadcast message to the owner only, as a preview/test.
+ */
+function handleTestSend(int $chatId, int $userId): void {
+    $state = getState($userId);
+    if (!$state || ($state['data']['message_data'] ?? null) === null) {
+        sendMessage($chatId, ['type' => 'text', 'text' => '❌ No broadcast in progress to preview.']);
+        return;
+    }
+    sendMessage($chatId, ['type' => 'text', 'text' => '🧪 <b>Test preview:</b>', 'parse_mode' => 'HTML']);
+    sendMessage($userId, $state['data']['message_data']);
+}
+
+/**
+ * Per-broadcast analytics: delivery + click-through rate.
+ */
+function showBroadcastAnalytics(int $chatId, int $messageId, int $broadcastId): void {
+    $db = getDB();
+    $b = $db->querySingle("SELECT * FROM broadcasts WHERE id = {$broadcastId}", true);
+    if (!$b) {
+        editMessageText($chatId, $messageId, "Broadcast not found.", ['inline_keyboard' => [[['text' => '« Back', 'callback_data' => 'history']]]]);
+        return;
+    }
+    $sent   = (int)$b['sent_count'];
+    $failed = (int)$b['failed_count'];
+    $clicks = (int)$db->querySingle("SELECT COUNT(*) FROM clicks WHERE broadcast_id = {$broadcastId}");
+    $uniqueClicks = (int)$db->querySingle("SELECT COUNT(DISTINCT user_id) FROM clicks WHERE broadcast_id = {$broadcastId}");
+    $ctr = $sent > 0 ? round($uniqueClicks / $sent * 100, 1) : 0.0;
+    $deliveryRate = ($sent + $failed) > 0 ? round($sent / ($sent + $failed) * 100, 1) : 0.0;
+
+    $text  = "📈 <b>Broadcast #{$broadcastId} Analytics</b>\n\n";
+    $text .= "Status: {$b['status']}\n";
+    $text .= "👥 Target: " . formatNumber((int)$b['total_users']) . "\n";
+    $text .= "✅ Sent: " . formatNumber($sent) . " ({$deliveryRate}% delivery)\n";
+    $text .= "❌ Failed: " . formatNumber($failed) . "\n";
+    $text .= "🖱 Clicks: " . formatNumber($clicks) . " ({$uniqueClicks} unique, {$ctr}% CTR)\n";
+
+    editMessageText($chatId, $messageId, $text, ['inline_keyboard' => [[['text' => '« Back', 'callback_data' => 'history']]]]);
 }
 
 /**
@@ -1359,19 +1823,24 @@ function handleTargetSelection(int $chatId, int $userId, ?string $filter): void 
     $text .= "You are about to send a message to:\n";
     $text .= "👥 <b>" . formatNumber($targetCount) . " users</b>\n\n";
     $text .= "⏱ Estimated time: " . calculateETA($targetCount, MESSAGES_PER_MINUTE) . "\n\n";
-    $text .= "Type <code>{$confirmationCode}</code> to confirm and start broadcasting.";
-    
+    $text .= "Type <code>{$confirmationCode}</code> to confirm and start broadcasting.\n";
+    $text .= "Or press 🧪 to preview the message to yourself first.";
+
     // Update state
     setState($userId, 'awaiting_confirmation', [
         'message_data' => $messageData,
         'target_filter' => $filter,
         'confirmation_code' => $confirmationCode
     ]);
-    
+
     sendMessage($chatId, [
         'type' => 'text',
         'text' => $text,
-        'parse_mode' => 'HTML'
+        'parse_mode' => 'HTML',
+        'reply_markup' => json_encode(['inline_keyboard' => [
+            [['text' => '🧪 Test Send (to me)', 'callback_data' => 'test_send']],
+            [['text' => '❌ Cancel', 'callback_data' => 'menu']],
+        ]]),
     ]);
 }
 
@@ -1393,41 +1862,55 @@ function handleSourceSelection(int $chatId, int $userId, string $callbackData): 
  * Main entry point
  */
 function main(): void {
+    // Shared-secret gate for the management endpoints (?setup, ?cron, ?stats).
+    $requireKey = function (): bool {
+        $key = $_GET['key'] ?? '';
+        if (!hash_equals(CRON_SECRET, (string)$key)) {
+            http_response_code(403);
+            echo "Forbidden";
+            return false;
+        }
+        return true;
+    };
+
     // Handle setup endpoint
     if (isset($_GET['setup'])) {
+        if (!$requireKey()) return;
         initDatabase();
-        
+
         $webhookUrl = (isset($_SERVER['HTTPS']) ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'];
-        
+
         if (setWebhook($webhookUrl)) {
             echo "✅ Setup complete!\n\n";
             echo "Webhook URL: {$webhookUrl}\n";
             echo "Database: " . DB_FILE . "\n\n";
             echo "Add this to your cron (every minute):\n";
-            echo "* * * * * curl -s \"{$webhookUrl}?cron=1\" > /dev/null\n";
+            echo "* * * * * curl -s \"{$webhookUrl}?cron=1&key=" . CRON_SECRET . "\" > /dev/null\n";
         } else {
             echo "❌ Failed to set webhook. Check BOT_TOKEN.";
         }
-        
+
         return;
     }
-    
+
     // Handle cron endpoint
     if (isset($_GET['cron'])) {
+        if (!$requireKey()) return;
+        set_time_limit(0);
         processQueue();
-        retryFailed();
         echo "OK";
         return;
     }
-    
-    // Handle health endpoint
+
+    // Handle health endpoint (no secrets leaked)
     if (isset($_GET['health'])) {
         echo "OK";
         return;
     }
-    
+
     // Handle stats endpoint
     if (isset($_GET['stats'])) {
+        if (!$requireKey()) return;
         $db = getDB();
         $stats = [
             'total_users' => $db->querySingle("SELECT COUNT(DISTINCT user_id) FROM users"),
@@ -1441,9 +1924,15 @@ function main(): void {
         return;
     }
     
-    // Handle webhook (incoming updates)
+    // Handle webhook (incoming updates) — validate Telegram's secret token first.
+    $providedSecret = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
+    if (!hash_equals(WEBHOOK_SECRET, (string)$providedSecret)) {
+        http_response_code(403);
+        return;
+    }
+
     $input = file_get_contents('php://input');
-    
+
     if (!$input) {
         http_response_code(400);
         return;
